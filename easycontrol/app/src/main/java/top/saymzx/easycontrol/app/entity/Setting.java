@@ -10,7 +10,9 @@ public final class Setting {
   private final SharedPreferences.Editor editor;
 
   public boolean getIsActive() {
-    return sharedPreferences.getBoolean("isActive", false);
+    // Modified build: upstream omits ActiveHelper and tells self-builders to
+    // skip activation. This fork always treats the app as active.
+    return true;
   }
 
   public void setIsActive(boolean value) {

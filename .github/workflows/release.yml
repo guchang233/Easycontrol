@@ -1,0 +1,122 @@
+name: Build release APK
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK 34
+        run: |
+          set -euo pipefail
+          SDK="$HOME/android-sdk"
+          mkdir -p "$SDK/cmdline-tools"
+          wget -q -O /tmp/cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          rm -rf /tmp/cmdtools-extract
+          unzip -q /tmp/cmdtools.zip -d /tmp/cmdtools-extract
+          mv /tmp/cmdtools-extract/cmdline-tools "$SDK/cmdline-tools/latest"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "$SDK/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$SDK/platform-tools" >> "$GITHUB_PATH"
+          echo "$SDK/build-tools/34.0.0" >> "$GITHUB_PATH"
+          mkdir -p "$SDK/licenses"
+          printf '%s\n' "24333f8a63b6825ea9c5514f83c2829b004d1fee" > "$SDK/licenses/android-sdk-license"
+          "$SDK/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK" --install "platforms;android-34" "build-tools;34.0.0" "platform-tools"
+
+      - name: Prepare signing keystore
+        working-directory: easycontrol
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -n "${ANDROID_KEYSTORE_BASE64}" ] && [ -n "${ANDROID_KEYSTORE_PASSWORD}" ] && [ -n "${ANDROID_KEY_ALIAS}" ] && [ -n "${ANDROID_KEY_PASSWORD}" ]; then
+            echo "Using keystore from repository secrets."
+            mkdir -p "${RUNNER_TEMP}/signing"
+            printf '%s' "${ANDROID_KEYSTORE_BASE64}" | base64 -d > "${RUNNER_TEMP}/signing/release.jks"
+            test -s "${RUNNER_TEMP}/signing/release.jks"
+            {
+              echo "ANDROID_KEYSTORE_PATH=${RUNNER_TEMP}/signing/release.jks"
+              echo "ANDROID_KEYSTORE_PASSWORD=${ANDROID_KEYSTORE_PASSWORD}"
+              echo "ANDROID_KEY_ALIAS=${ANDROID_KEY_ALIAS}"
+              echo "ANDROID_KEY_PASSWORD=${ANDROID_KEY_PASSWORD}"
+            } >> "$GITHUB_ENV"
+          else
+            echo "Signing secrets are not set. Using the keystore committed in this repository."
+            test -s keystore.properties
+            test -s keystore/easycontrol-release.jks
+          fi
+
+      - name: Build server module
+        working-directory: easycontrol
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :server:copyRelease --no-daemon --stacktrace
+
+      - name: Build release APK
+        working-directory: easycontrol
+        run: ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Collect signed APK
+        working-directory: easycontrol
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apk=(app/build/outputs/apk/release/*.apk)
+          if [ "${#apk[@]}" -eq 0 ]; then
+            echo "No release APK was produced."
+            find app/build/outputs -name '*.apk' -o -name '*.aab' || true
+            exit 1
+          fi
+          mkdir -p dist
+          cp "${apk[0]}" dist/Easycontrol-1.5.7-free.apk
+          "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --print-certs dist/Easycontrol-1.5.7-free.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Easycontrol-1.5.7-free
+          path: easycontrol/dist/Easycontrol-1.5.7-free.apk
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('manual-{0}', github.run_id) }}
+          name: ${{ github.ref_type == 'tag' && github.ref_name || format('manual-{0}', github.run_id) }}
+          files: easycontrol/dist/Easycontrol-1.5.7-free.apk
+          fail_on_unmatched_files: true
+          body: |
+            Modified version of [mingzhixian/Easycontrol](https://github.com/mingzhixian/Easycontrol) (GPL-3.0, license unchanged).
+
+            This build disables the activation check. `versionName` is `1.5.7-free`.
+
+            Asset: `Easycontrol-1.5.7-free.apk` (server module is embedded in the APK).
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
